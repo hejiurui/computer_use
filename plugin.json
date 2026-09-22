@@ -1,0 +1,36 @@
+{
+  "name": "computer-use-windows",
+  "version": "1.0.0",
+  "description": "Control desktop apps on Windows from any MCP client through a local MCP server.",
+  "author": {
+    "name": "hejiurui"
+  },
+  "license": "MIT",
+  "repository": "https://github.com/hejiurui/computer_use",
+  "keywords": [
+    "computer-use",
+    "windows",
+    "desktop-control",
+    "automation",
+    "mcp"
+  ],
+  "mcpServers": "./.mcp.json",
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Computer Use",
+    "shortDescription": "Control Windows apps from an MCP client",
+    "longDescription": "Windows Computer Use lets an MCP client inspect your desktop with screenshots and UI trees and drive the mouse and keyboard through a local MCP server. Interactive desktop only; cannot control elevated UAC prompts or the secure desktop. Use only on machines you own or are authorized to operate.",
+    "category": "Productivity",
+    "capabilities": [
+      "Interactive",
+      "Read",
+      "Write"
+    ],
+    "brandColor": "#0F172A",
+    "defaultPrompt": [
+      "用 Computer Use 查看当前桌面并告诉我屏幕上有什么。",
+      "用 Computer Use 点击当前应用并报告变化。",
+      "用 Computer Use 在活动窗口里填写表单。"
+    ]
+  }
+}

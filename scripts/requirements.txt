@@ -1,0 +1,5 @@
+mcp>=1.2.0,<2
+pyautogui
+pillow
+mss
+uiautomation
