@@ -45,10 +45,17 @@ mcp = FastMCP("Computer Use (Windows)", json_response=True)
 | 键盘 | `type_text` `type_unicode` `press_key` `hotkey` `scroll` `wait` |
 | 剪贴板 | `get_clipboard` `set_clipboard` |
 | 窗口 | `list_windows` `focus_window` `run_program` `open_app` |
-| UIA | `get_ui_tree` `find_and_click_element` `get_window_text` |
+| UIA | `get_ui_tree` `find_and_click_element` `set_element_value` `invoke_element` `get_window_text` |
 | 消息 | `send_text_to_window` `send_keys_to_window` |
-| OCR | `extract_text` `extract_text_active_window` |
+| OCR | `extract_text` `extract_text_active_window` `click_text` |
 | 组合 | `batch_actions` `observe_screen` |
+
+### P1 行为说明
+
+- **OCR 词框**：`extract_text` 返回 `words: [{text,left,top,right,bottom}]`（屏幕绝对坐标，`coordinate_space=screen`）。`click_text` 按词匹配（精确优先）并点击中心。
+- **UIA**：`find_and_click_element` 支持 `automation_id`；`set_element_value` 走 ValuePattern；`invoke_element` 支持 invoke/toggle/expand/collapse/select。UI 树节点含 `automation_id`，子节点截断时标 `truncated`。
+- **后台输入**：`type_text` / `type_unicode` / `send_text_to_window` 可用 `background=true`（`EM_REPLACESEL`，不走 SendInput）。默认剪贴板粘贴会 `restore_clipboard=true` 还原用户剪贴板。
+- **UAC / 高完整性**：对 elevated 目标窗口返回 `code=elevated_target` 明确失败，不假装成功、不遍历 HIGH-IL UIA。
 
 ## 安装
 

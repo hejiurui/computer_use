@@ -12,7 +12,9 @@ import base64
 import ctypes
 import ctypes.wintypes
 import io
+import json
 import logging
+import os
 import platform
 import subprocess
 import sys
@@ -200,6 +202,113 @@ def _get_window_title(hwnd: int) -> str:
     return buf.value
 
 
+def _get_window_pid(hwnd: int) -> int:
+    pid = ctypes.wintypes.DWORD()
+    ctypes.windll.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+    return int(pid.value)
+
+
+# TokenIntegrityLevel = 25; RIDs: 0x1000 low, 0x2000 medium, 0x3000 high, 0x4000 system
+_INTEGRITY_RID = {
+    0x1000: "low",
+    0x2000: "medium",
+    0x3000: "high",
+    0x4000: "system",
+}
+
+
+def _get_process_integrity(pid: int) -> dict:
+    """Return {integrity, elevated, error} for a process. Honest probe — no silent success."""
+    TOKEN_QUERY = 0x0008
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    TokenIntegrityLevel = 25
+    kernel32 = ctypes.windll.kernel32
+    advapi32 = ctypes.windll.advapi32
+    handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if not handle:
+        return {
+            "integrity": "unknown",
+            "elevated": None,
+            "error": f"OpenProcess failed ({ctypes.GetLastError()})",
+        }
+    token = ctypes.wintypes.HANDLE()
+    try:
+        if not advapi32.OpenProcessToken(handle, TOKEN_QUERY, ctypes.byref(token)):
+            return {
+                "integrity": "unknown",
+                "elevated": None,
+                "error": f"OpenProcessToken failed ({ctypes.GetLastError()})",
+            }
+        needed = ctypes.wintypes.DWORD()
+        advapi32.GetTokenInformation(
+            token, TokenIntegrityLevel, None, 0, ctypes.byref(needed)
+        )
+        buf = ctypes.create_string_buffer(max(needed.value, 128))
+        if not advapi32.GetTokenInformation(
+            token, TokenIntegrityLevel, buf, needed, ctypes.byref(needed)
+        ):
+            return {
+                "integrity": "unknown",
+                "elevated": None,
+                "error": f"GetTokenInformation failed ({ctypes.GetLastError()})",
+            }
+
+        class SID_AND_ATTRIBUTES(ctypes.Structure):
+            _fields_ = [("Sid", ctypes.c_void_p), ("Attributes", ctypes.wintypes.DWORD)]
+
+        class TOKEN_MANDATORY_LABEL(ctypes.Structure):
+            _fields_ = [("Label", SID_AND_ATTRIBUTES)]
+
+        tml = TOKEN_MANDATORY_LABEL.from_buffer_copy(buf.raw)
+        get_sub_auth_count = advapi32.GetSidSubAuthorityCount
+        get_sub_auth_count.restype = ctypes.POINTER(ctypes.c_ubyte)
+        get_sub_auth_count.argtypes = [ctypes.c_void_p]
+        get_sub_auth = advapi32.GetSidSubAuthority
+        get_sub_auth.restype = ctypes.POINTER(ctypes.wintypes.DWORD)
+        get_sub_auth.argtypes = [ctypes.c_void_p, ctypes.wintypes.DWORD]
+        sub_auth_count = get_sub_auth_count(tml.Label.Sid)
+        if not sub_auth_count:
+            return {"integrity": "unknown", "elevated": None, "error": "sid subauth missing"}
+        rid = get_sub_auth(tml.Label.Sid, int(sub_auth_count.contents.value) - 1)
+        rid_val = int(rid.contents.value) if rid else 0
+        integrity = _INTEGRITY_RID.get(rid_val & 0xF000, f"rid_{rid_val}")
+        elevated = integrity in ("high", "system")
+        return {"integrity": integrity, "elevated": elevated, "error": None}
+    finally:
+        kernel32.CloseHandle(handle)
+        if token:
+            kernel32.CloseHandle(token)
+
+
+def _check_target_access(hwnd: int) -> dict | None:
+    """Return an error payload if the window's process is elevated above us (UAC boundary)."""
+    if not hwnd:
+        return None
+    current = _get_process_integrity(os.getpid())
+    target = _get_process_integrity(_get_window_pid(hwnd))
+    if target.get("error"):
+        return {
+            "ok": False,
+            "code": "process_query_failed",
+            "error": target["error"],
+            "hwnd": hwnd,
+        }
+    if target.get("elevated") and not current.get("elevated"):
+        return {
+            "ok": False,
+            "code": "elevated_target",
+            "error": (
+                f"Target window is elevated (integrity={target.get('integrity')}) while this MCP "
+                f"runs at integrity={current.get('integrity')}. UIA/input will fail or crash; "
+                "refusing instead of silent no-op. Restart the host elevated or choose a non-elevated window."
+            ),
+            "hwnd": hwnd,
+            "target_integrity": target.get("integrity"),
+            "self_integrity": current.get("integrity"),
+        }
+    return None
+
+
 def _setup_clipboard_ctypes() -> None:
     import ctypes as _ct
 
@@ -271,6 +380,62 @@ def _clipboard_get_unicode() -> str:
         user32.CloseClipboard()
 
 
+_EDIT_CLASS_NAMES = {"edit", "richedit", "richedit20a", "richedit20w", "richedit50w", "texbox"}
+
+
+def _find_edit_hwnd(root: int | None = None) -> int:
+    """Find a focused-or-first edit/richedit child window for background EM_REPLACESEL."""
+    user32 = ctypes.windll.user32
+    root = root or user32.GetForegroundWindow()
+    if not root:
+        return 0
+    found = user32.GetFocus()
+    if found and _hwnd_class_name(found).lower() in _EDIT_CLASS_NAMES:
+        return found
+    result = {"hwnd": 0}
+
+    def _callback(hwnd: int, _lParam: Any) -> bool:
+        if _hwnd_class_name(hwnd).lower() in _EDIT_CLASS_NAMES:
+            result["hwnd"] = hwnd
+            return False
+        return True
+
+    EnumChildProc = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_int, ctypes.POINTER(ctypes.c_int))
+    user32.EnumChildWindows(root, EnumChildProc(_callback), 0)
+    return int(result["hwnd"])
+
+
+def _hwnd_class_name(hwnd: int) -> str:
+    buf = ctypes.create_unicode_buffer(256)
+    ctypes.windll.user32.GetClassNameW(hwnd, buf, 256)
+    return buf.value
+
+
+def _type_background_unicode(text: str, hwnd: int | None = None) -> dict:
+    """Type into an edit control via EM_SETSEL/EM_REPLACESEL without stealing focus semantics of SendInput."""
+    user32 = ctypes.windll.user32
+    target = hwnd or _find_edit_hwnd()
+    if not target:
+        return {
+            "ok": False,
+            "code": "no_edit_control",
+            "error": "No edit/richedit control found for background typing",
+        }
+    EM_SETSEL = 0x00B1
+    EM_REPLACESEL = 0x00C2
+    user32.SendMessageW(target, EM_SETSEL, 0, -1)
+    buf = ctypes.create_unicode_buffer(text)
+    ok = user32.SendMessageW(target, EM_REPLACESEL, True, buf)
+    return {
+        "ok": True,
+        "method": "em_replacesel",
+        "hwnd": int(target),
+        "class": _hwnd_class_name(target),
+        "characters": len(text),
+        "replace_result": int(ok),
+    }
+
+
 _UIA_AVAILABLE = False
 try:
     import uiautomation as uia
@@ -284,6 +449,7 @@ def _walk_ui_tree(control: Any, depth: int, max_children: int = 20) -> dict:
     info: dict[str, Any] = {
         "name": control.Name or "",
         "type": control.ControlTypeName,
+        "automation_id": getattr(control, "AutomationId", None) or "",
         "rect": {
             "left": control.BoundingRectangle.left,
             "top": control.BoundingRectangle.top,
@@ -296,24 +462,39 @@ def _walk_ui_tree(control: Any, depth: int, max_children: int = 20) -> dict:
     children = []
     child = control.GetFirstChildControl()
     count = 0
-    while child and count < max_children:
+    truncated = False
+    while child:
+        if count >= max_children:
+            truncated = True
+            break
         children.append(_walk_ui_tree(child, depth - 1, max_children))
         child = child.GetNextSiblingControl()
         count += 1
     if children:
         info["children"] = children
+    if truncated:
+        info["truncated"] = True
     return info
 
 
-def _find_control_recursive(control: Any, name: str, control_type: str = "") -> Any:
-    name_lower = name.lower()
+def _find_control_recursive(
+    control: Any,
+    name: str = "",
+    control_type: str = "",
+    automation_id: str = "",
+) -> Any:
+    name_lower = (name or "").lower()
+    aid_lower = (automation_id or "").lower()
     child = control.GetFirstChildControl()
     while child:
         child_name = (child.Name or "").lower()
-        if name_lower in child_name:
-            if not control_type or child.ControlTypeName == control_type:
-                return child
-        found = _find_control_recursive(child, name, control_type)
+        child_aid = (getattr(child, "AutomationId", None) or "").lower()
+        name_ok = (not name_lower) or (name_lower in child_name)
+        aid_ok = (not aid_lower) or (aid_lower in child_aid)
+        type_ok = (not control_type) or (child.ControlTypeName == control_type)
+        if name_ok and aid_ok and type_ok and (name_lower or aid_lower or control_type):
+            return child
+        found = _find_control_recursive(child, name, control_type, automation_id)
         if found:
             return found
         child = child.GetNextSiblingControl()
@@ -338,32 +519,61 @@ def _collect_text_recursive(control: Any, texts: list, max_items: int = 200) -> 
         child = child.GetNextSiblingControl()
 
 
-def _ocr_image(image: PILImage.Image) -> str:
+def _ocr_image(image: PILImage.Image) -> dict:
+    """OCR via Windows.Media.Ocr. Returns {text, words:[{text,left,top,right,bottom}]} in image pixels."""
     buf = io.BytesIO()
-    image.save(buf, format="BMP")
+    image.save(buf, format="PNG")
     b64 = base64.b64encode(buf.getvalue()).decode("ascii")
     ps_script = r"""
 Add-Type -AssemblyName System.Runtime.WindowsRuntime
-$bmpBytes = New-Object System.IO.MemoryStream(,[System.Convert]::FromBase64String($input))
-[Windows.Graphics.Imaging.BitmapDecoder, Windows.Graphics.Imaging, ContentType=WindowsRuntime] | Out-Null
-[Windows.Media.Ocr.OcrEngine, Windows.Media.Ocr, ContentType=WindowsRuntime] | Out-Null
-$bmpStream = [Windows.Storage.Streams.InMemoryRandomAccessStream]::new()
-$writer = [Windows.Storage.Streams.DataWriter]::new($bmpStream)
-$writer.WriteBytes($bmpBytes.ToArray())
-$writer.StoreAsync().GetResults() | Out-Null
-$writer.FlushAsync().GetResults() | Out-Null
-$bmpStream.Seek(0)
-$task = [Windows.Graphics.Imaging.BitmapDecoder]::CreateAsync($bmpStream)
-while (-not $task.Status) { Start-Sleep -Milliseconds 10 }
-$decoder = $task.GetResults()
-$task2 = $decoder.GetSoftwareBitmapAsync()
-while (-not $task2.Status) { Start-Sleep -Milliseconds 10 }
-$bitmap = $task2.GetResults()
-$ocrEngine = [Windows.Media.Ocr.OcrEngine]::TryCreateFromUserProfileLanguages()
-$task3 = $ocrEngine.RecognizeAsync($bitmap)
-while (-not $task3.Status) { Start-Sleep -Milliseconds 10 }
-$result = $task3.GetResults()
-$result.Text
+$null = [Windows.Storage.StorageFile, Windows.Storage, ContentType=WindowsRuntime]
+$null = [Windows.Storage.FileAccessMode, Windows.Storage, ContentType=WindowsRuntime]
+$null = [Windows.Graphics.Imaging.BitmapDecoder, Windows.Graphics.Imaging, ContentType=WindowsRuntime]
+$null = [Windows.Graphics.Imaging.SoftwareBitmap, Windows.Graphics.Imaging, ContentType=WindowsRuntime]
+$null = [Windows.Media.Ocr.OcrEngine, Windows.Media.Ocr, ContentType=WindowsRuntime]
+$asTaskGeneric = ([System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object {
+  $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1'
+})[0]
+function Await($WinRtTask, $ResultType) {
+  $asTask = $asTaskGeneric.MakeGenericMethod($ResultType)
+  $netTask = $asTask.Invoke($null, @($WinRtTask))
+  $netTask.Wait(-1) | Out-Null
+  return $netTask.Result
+}
+$b64 = [Console]::In.ReadToEnd().Trim()
+$bytes = [Convert]::FromBase64String($b64)
+$tmp = Join-Path ([IO.Path]::GetTempPath()) (([IO.Path]::GetRandomFileName()) + '.png')
+[IO.File]::WriteAllBytes($tmp, $bytes)
+try {
+  $file = Await ([Windows.Storage.StorageFile]::GetFileFromPathAsync($tmp)) ([Windows.Storage.StorageFile])
+  $stream = Await ($file.OpenAsync([Windows.Storage.FileAccessMode]::Read)) ([Windows.Storage.Streams.IRandomAccessStream])
+  $decoder = Await ([Windows.Graphics.Imaging.BitmapDecoder]::CreateAsync($stream)) ([Windows.Graphics.Imaging.BitmapDecoder])
+  $soft = Await ($decoder.GetSoftwareBitmapAsync()) ([Windows.Graphics.Imaging.SoftwareBitmap])
+  $bitmap = [Windows.Graphics.Imaging.SoftwareBitmap]::Convert(
+    $soft,
+    [Windows.Graphics.Imaging.BitmapPixelFormat]::Bgra8,
+    [Windows.Graphics.Imaging.BitmapAlphaMode]::Premultiplied
+  )
+  $ocrEngine = [Windows.Media.Ocr.OcrEngine]::TryCreateFromUserProfileLanguages()
+  if ($null -eq $ocrEngine) { Write-Output '{"text":"","words":[],"error":"no_ocr_engine"}'; exit 0 }
+  $result = Await ($ocrEngine.RecognizeAsync($bitmap)) ([Windows.Media.Ocr.OcrResult])
+  $words = New-Object System.Collections.Generic.List[object]
+  foreach ($line in $result.Lines) {
+    foreach ($word in $line.Words) {
+      $r = $word.BoundingRect
+      $words.Add(@{
+        text = $word.Text
+        left = [int][Math]::Round($r.X)
+        top = [int][Math]::Round($r.Y)
+        right = [int][Math]::Round($r.X + $r.Width)
+        bottom = [int][Math]::Round($r.Y + $r.Height)
+      })
+    }
+  }
+  ConvertTo-Json @{ text = $result.Text; words = $words } -Compress -Depth 4
+} finally {
+  Remove-Item -Force -ErrorAction SilentlyContinue $tmp
+}
 """
     try:
         proc = subprocess.run(
@@ -371,12 +581,69 @@ $result.Text
             input=b64,
             capture_output=True,
             text=True,
-            timeout=20,
+            encoding="utf-8",
+            errors="replace",
+            timeout=45,
         )
-        return proc.stdout.strip()
+        raw = (proc.stdout or "").strip()
+        if not raw:
+            return {"text": "", "words": [], "error": (proc.stderr or "OCR returned empty").strip()[:500]}
+        data = json.loads(raw)
+        return {
+            "text": data.get("text") or "",
+            "words": data.get("words") or [],
+            "error": data.get("error"),
+        }
     except Exception as exc:
         logger.warning("OCR failed: %s", exc)
-        return ""
+        return {"text": "", "words": [], "error": str(exc)}
+
+
+def _ocr_capture(
+    x: int | None, y: int | None, width: int | None, height: int | None
+) -> dict:
+    """Capture + OCR. Word boxes mapped to absolute screen coordinates."""
+    image, info = _capture_image(x, y, width, height)
+    ocr = _ocr_image(image)
+    words = []
+    for word in ocr.get("words") or []:
+        words.append(
+            {
+                "text": word.get("text") or "",
+                "left": info.origin_x + int(word.get("left") or 0),
+                "top": info.origin_y + int(word.get("top") or 0),
+                "right": info.origin_x + int(word.get("right") or 0),
+                "bottom": info.origin_y + int(word.get("bottom") or 0),
+            }
+        )
+    result = {
+        "text": ocr.get("text") or "",
+        "words": words,
+        "origin_x": info.origin_x,
+        "origin_y": info.origin_y,
+        "coordinate_space": "screen",
+    }
+    if ocr.get("error"):
+        result["error"] = ocr["error"]
+    return result
+
+
+def _match_ocr_word(words: list[dict], query: str) -> dict | None:
+    """Best word/line-ish match for query (case-insensitive substring; exact word preferred)."""
+    q = (query or "").strip().lower()
+    if not q:
+        return None
+    exact = None
+    substring = None
+    for word in words:
+        text = (word.get("text") or "").strip()
+        lowered = text.lower()
+        if lowered == q:
+            exact = word
+            break
+        if q in lowered and substring is None:
+            substring = word
+    return exact or substring
 
 
 # ---------------------------------------------------------------------------
@@ -557,21 +824,42 @@ def drag_mouse(
 
 
 @mcp.tool()
-def type_text(text: str, interval: float = 0.0) -> dict:
-    """Type ASCII text into the active window. For CJK/emoji use type_unicode."""
+def type_text(text: str, interval: float = 0.0, background: bool = False) -> dict:
+    """Type ASCII text. background=true uses EM_REPLACESEL on an edit control (no SendInput)."""
     _ensure_windows()
+    if background:
+        return _type_background_unicode(text)
     pyautogui.write(text, interval=max(interval, 0.0))
-    return {"ok": True, "characters": len(text)}
+    return {"ok": True, "method": "sendinput", "characters": len(text)}
 
 
 @mcp.tool()
-def type_unicode(text: str) -> dict:
-    """Type Unicode text (Chinese, Japanese, emoji, ...) via clipboard paste (Ctrl+V)."""
+def type_unicode(
+    text: str,
+    background: bool = False,
+    restore_clipboard: bool = True,
+) -> dict:
+    """Type Unicode text (CJK/emoji). Default: clipboard paste (Ctrl+V). background=true uses EM_REPLACESEL."""
     _ensure_windows()
+    if background:
+        return _type_background_unicode(text)
+    previous = _clipboard_get_unicode() if restore_clipboard else None
     _clipboard_set_unicode(text)
     pyautogui.hotkey("ctrl", "v")
     time.sleep(0.05)
-    return {"ok": True, "characters": len(text)}
+    restored = False
+    if restore_clipboard and previous is not None:
+        try:
+            _clipboard_set_unicode(previous)
+            restored = True
+        except Exception as exc:
+            logger.warning("clipboard restore failed: %s", exc)
+    return {
+        "ok": True,
+        "method": "clipboard_paste",
+        "characters": len(text),
+        "clipboard_restored": restored,
+    }
 
 
 @mcp.tool()
@@ -780,11 +1068,15 @@ def open_app(name: str) -> dict:
 
 
 @mcp.tool()
-def get_ui_tree(depth: int = 3, max_children: int = 20) -> dict:
+def get_ui_tree(depth: int = 3, max_children: int = 50) -> dict:
     """Return the accessibility UI tree of the foreground window (low-token alternative to screenshots)."""
     _ensure_windows()
     if not _UIA_AVAILABLE:
         return {"ok": False, "error": "uiautomation package not installed"}
+    hwnd = _get_foreground_hwnd()
+    access_error = _check_target_access(hwnd)
+    if access_error:
+        return access_error
     try:
         root = uia.GetForegroundControl()
         if root is None:
@@ -798,19 +1090,30 @@ def get_ui_tree(depth: int = 3, max_children: int = 20) -> dict:
 
 @mcp.tool()
 def find_and_click_element(
-    name: str,
+    name: str = "",
     control_type: str = "",
+    automation_id: str = "",
     click_button: Literal["left", "right"] = "left",
 ) -> dict:
-    """Find a UI element by name (optional ControlType) in the foreground window and click it. No screenshot needed."""
+    """Find a UI element by name and/or AutomationId (optional ControlType) in the foreground window and click it."""
     _ensure_windows()
     if not _UIA_AVAILABLE:
         return {"ok": False, "error": "uiautomation package not installed"}
+    if not (name or automation_id or control_type):
+        return {"ok": False, "error": "Provide name and/or automation_id (and optional control_type)"}
+    hwnd = _get_foreground_hwnd()
+    access_error = _check_target_access(hwnd)
+    if access_error:
+        return access_error
     try:
         root = uia.GetForegroundControl()
-        target = _find_control_recursive(root, name, control_type)
+        target = _find_control_recursive(root, name=name, control_type=control_type, automation_id=automation_id)
         if target is None:
-            return {"ok": False, "error": f"Element '{name}' not found"}
+            return {
+                "ok": False,
+                "code": "not_found",
+                "error": f"Element not found (name={name!r}, automation_id={automation_id!r}, type={control_type!r})",
+            }
         rect = target.BoundingRectangle
         cx = (rect.left + rect.right) // 2
         cy = (rect.top + rect.bottom) // 2
@@ -819,11 +1122,154 @@ def find_and_click_element(
             "ok": True,
             "name": target.Name,
             "type": target.ControlTypeName,
+            "automation_id": getattr(target, "AutomationId", None) or "",
             "clicked_x": cx,
             "clicked_y": cy,
+            "coordinate_space": "screen",
         }
     except Exception as exc:
         return {"ok": False, "error": str(exc)}
+
+
+@mcp.tool()
+def set_element_value(
+    value: str,
+    name: str = "",
+    automation_id: str = "",
+    control_type: str = "",
+) -> dict:
+    """Set a UI element's value via ValuePattern (text boxes, combos). No mouse click."""
+    _ensure_windows()
+    if not _UIA_AVAILABLE:
+        return {"ok": False, "error": "uiautomation package not installed"}
+    hwnd = _get_foreground_hwnd()
+    access_error = _check_target_access(hwnd)
+    if access_error:
+        return access_error
+    try:
+        root = uia.GetForegroundControl()
+        target = _find_control_recursive(root, name=name, control_type=control_type, automation_id=automation_id)
+        if target is None:
+            return {"ok": False, "code": "not_found", "error": "Element not found"}
+        try:
+            vp = target.GetValuePattern()
+            if vp is not None:
+                vp.SetValue(value)
+                return {
+                    "ok": True,
+                    "method": "value_pattern",
+                    "name": target.Name,
+                    "automation_id": getattr(target, "AutomationId", None) or "",
+                    "value": value,
+                }
+        except Exception as exc:
+            logger.debug("ValuePattern failed: %s", exc)
+        return {
+            "ok": False,
+            "code": "no_value_pattern",
+            "error": "Element does not support ValuePattern.SetValue",
+        }
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+@mcp.tool()
+def invoke_element(
+    name: str = "",
+    automation_id: str = "",
+    control_type: str = "",
+    action: Literal["invoke", "toggle", "expand", "collapse", "select"] = "invoke",
+) -> dict:
+    """Invoke/Toggle/Expand/Select a UI element via UIA patterns (buttons, checkboxes, trees)."""
+    _ensure_windows()
+    if not _UIA_AVAILABLE:
+        return {"ok": False, "error": "uiautomation package not installed"}
+    hwnd = _get_foreground_hwnd()
+    access_error = _check_target_access(hwnd)
+    if access_error:
+        return access_error
+    try:
+        root = uia.GetForegroundControl()
+        target = _find_control_recursive(root, name=name, control_type=control_type, automation_id=automation_id)
+        if target is None:
+            return {"ok": False, "code": "not_found", "error": "Element not found"}
+        errors: list[str] = []
+        try:
+            if action == "invoke":
+                ip = target.GetInvokePattern()
+                if ip:
+                    ip.Invoke()
+                    return {"ok": True, "method": "invoke_pattern", "name": target.Name, "action": action}
+                errors.append("no InvokePattern")
+            if action == "toggle":
+                tp = target.GetTogglePattern()
+                if tp:
+                    tp.Toggle()
+                    return {"ok": True, "method": "toggle_pattern", "name": target.Name, "action": action}
+                errors.append("no TogglePattern")
+            if action in ("expand", "collapse"):
+                ep = target.GetExpandCollapsePattern()
+                if ep:
+                    ep.Expand() if action == "expand" else ep.Collapse()
+                    return {"ok": True, "method": "expand_collapse_pattern", "name": target.Name, "action": action}
+                errors.append("no ExpandCollapsePattern")
+            if action == "select":
+                sp = target.GetSelectionItemPattern()
+                if sp:
+                    sp.Select()
+                    return {"ok": True, "method": "selection_item_pattern", "name": target.Name, "action": action}
+                errors.append("no SelectionItemPattern")
+        except Exception as exc:
+            errors.append(str(exc))
+        return {
+            "ok": False,
+            "code": "pattern_unavailable",
+            "error": "; ".join(errors) or f"action {action} failed",
+            "name": target.Name,
+        }
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+@mcp.tool()
+def click_text(
+    text: str,
+    x: int | None = None,
+    y: int | None = None,
+    width: int | None = None,
+    height: int | None = None,
+    button: Literal["left", "right"] = "left",
+    clicks: int = 1,
+) -> dict:
+    """OCR a screen region and click the center of the best-matching word (exact match preferred)."""
+    _ensure_windows()
+    ocr = _ocr_capture(x, y, width, height)
+    match = _match_ocr_word(ocr.get("words") or [], text)
+    if not match:
+        return {
+            "ok": False,
+            "code": "text_not_found",
+            "error": f"No OCR word matching {text!r}",
+            "ocr_text": (ocr.get("text") or "")[:500],
+            "word_count": len(ocr.get("words") or []),
+        }
+    cx = (int(match["left"]) + int(match["right"])) // 2
+    cy = (int(match["top"]) + int(match["bottom"])) // 2
+    pyautogui.click(cx, cy, button=button, clicks=max(clicks, 1))
+    return {
+        "ok": True,
+        "matched_text": match["text"],
+        "clicked_x": cx,
+        "clicked_y": cy,
+        "box": {
+            "left": match["left"],
+            "top": match["top"],
+            "right": match["right"],
+            "bottom": match["bottom"],
+        },
+        "coordinate_space": "screen",
+        "method": "ocr_click",
+    }
 
 
 @mcp.tool()
@@ -834,6 +1280,10 @@ def get_window_text(title: str) -> dict:
     if not focus_result.get("ok"):
         return focus_result
     time.sleep(0.15)
+    hwnd = focus_result.get("hwnd") or _get_foreground_hwnd()
+    access_error = _check_target_access(hwnd)
+    if access_error:
+        return access_error
     if _UIA_AVAILABLE:
         try:
             root = uia.GetForegroundControl()
@@ -856,44 +1306,87 @@ def get_window_text(title: str) -> dict:
 
 
 @mcp.tool()
-def send_text_to_window(title: str, text: str, paste: bool = True) -> dict:
-    """Focus a window and send text to its focused control (clipboard paste by default)."""
+def send_text_to_window(
+    title: str,
+    text: str,
+    paste: bool = True,
+    background: bool = False,
+    restore_clipboard: bool = True,
+) -> dict:
+    """Focus a window and send text. paste=clipboard Ctrl+V; background=EM_REPLACESEL; else WM_SETTEXT."""
     _ensure_windows()
     focus_result = focus_window(title)
     if not focus_result.get("ok"):
         return focus_result
     time.sleep(0.15)
+    hwnd = int(focus_result.get("hwnd") or 0)
+    access_error = _check_target_access(hwnd)
+    if access_error:
+        return access_error
+    if background:
+        return _type_background_unicode(text, hwnd=_find_edit_hwnd(hwnd) or hwnd)
     if paste:
+        previous = _clipboard_get_unicode() if restore_clipboard else None
         _clipboard_set_unicode(text)
         pyautogui.hotkey("ctrl", "v")
         time.sleep(0.05)
-        return {"ok": True, "method": "clipboard_paste", "characters": len(text)}
-    hwnd = ctypes.windll.user32.GetFocus() or ctypes.windll.user32.GetForegroundWindow()
+        restored = False
+        if restore_clipboard and previous is not None:
+            try:
+                _clipboard_set_unicode(previous)
+                restored = True
+            except Exception as exc:
+                logger.warning("clipboard restore failed: %s", exc)
+        return {
+            "ok": True,
+            "method": "clipboard_paste",
+            "characters": len(text),
+            "clipboard_restored": restored,
+        }
+    edit_hwnd = _find_edit_hwnd(hwnd) or (ctypes.windll.user32.GetFocus() or hwnd)
     WM_SETTEXT = 0x000C
     buf = ctypes.create_unicode_buffer(text)
-    ctypes.windll.user32.SendMessageW(hwnd, WM_SETTEXT, 0, buf)
-    return {"ok": True, "method": "wm_settext", "hwnd": hwnd, "characters": len(text)}
+    ctypes.windll.user32.SendMessageW(edit_hwnd, WM_SETTEXT, 0, buf)
+    return {"ok": True, "method": "wm_settext", "hwnd": int(edit_hwnd), "characters": len(text)}
 
 
 @mcp.tool()
-def send_keys_to_window(title: str, text: str, send_enter: bool = False) -> dict:
+def send_keys_to_window(
+    title: str,
+    text: str,
+    send_enter: bool = False,
+    restore_clipboard: bool = True,
+) -> dict:
     """Focus a window, paste Unicode text, and optionally press Enter (chat apps)."""
     _ensure_windows()
     focus_result = focus_window(title)
     if not focus_result.get("ok"):
         return focus_result
     time.sleep(0.15)
+    hwnd = int(focus_result.get("hwnd") or 0)
+    access_error = _check_target_access(hwnd)
+    if access_error:
+        return access_error
+    previous = _clipboard_get_unicode() if restore_clipboard else None
     _clipboard_set_unicode(text)
     pyautogui.hotkey("ctrl", "v")
     time.sleep(0.05)
     if send_enter:
         time.sleep(0.05)
         pyautogui.press("enter")
+    restored = False
+    if restore_clipboard and previous is not None:
+        try:
+            _clipboard_set_unicode(previous)
+            restored = True
+        except Exception as exc:
+            logger.warning("clipboard restore failed: %s", exc)
     return {
         "ok": True,
         "characters": len(text),
         "enter_sent": send_enter,
         "window": focus_result.get("title", ""),
+        "clipboard_restored": restored,
     }
 
 
@@ -909,18 +1402,28 @@ def extract_text(
     width: int | None = None,
     height: int | None = None,
 ) -> dict:
-    """Extract text from the screen or a region using Windows built-in OCR (no screenshot image)."""
+    """Extract text and word boxes from the screen/region via Windows OCR. Boxes are screen-absolute."""
     _ensure_windows()
-    image, _info = _capture_image(x, y, width, height)
-    text = _ocr_image(image)
-    if not text:
-        return {"ok": False, "error": "OCR returned no text"}
-    return {"ok": True, "text": text}
+    ocr = _ocr_capture(x, y, width, height)
+    if not ocr.get("text") and not ocr.get("words"):
+        return {
+            "ok": False,
+            "code": "ocr_empty",
+            "error": ocr.get("error") or "OCR returned no text",
+            "text": "",
+            "words": [],
+        }
+    return {
+        "ok": True,
+        "text": ocr.get("text") or "",
+        "words": ocr.get("words") or [],
+        "coordinate_space": "screen",
+    }
 
 
 @mcp.tool()
 def extract_text_active_window() -> dict:
-    """Extract text from the currently focused window using OCR."""
+    """Extract text and word boxes from the currently focused window using OCR."""
     _ensure_windows()
     hwnd = _get_foreground_hwnd()
     if not hwnd:
@@ -1004,6 +1507,7 @@ def observe_screen(
     if include_ocr:
         ocr_result = extract_text() if window_mismatch else extract_text_active_window()
         result["ocr_text"] = ocr_result.get("text", ocr_result.get("error", ""))
+        result["ocr_words"] = ocr_result.get("words", [])
     if include_screenshot:
         if window_mismatch:
             result["screenshot"] = screenshot(max_width=max_width, max_height=max_height, quality=quality)
